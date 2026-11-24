@@ -1,0 +1,298 @@
+#define _POSIX_C_SOURCE 200809L
+/*
+ * main.c — ValveWise CLI entry point
+ * Teammate B owns this file.
+ *
+ * Usage:
+ *   valvewise --input <file.inp> [--output <file.json>] [--budget N]
+ *             [--fail pipe1,pipe2] [--stuck valve1] [--mode full|rank|reach]
+ *             [--seed N] [--verbose]
+ *             [--hydraulics on|off] [--min-pressure N]
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "graph.h"
+#include "hashmap.h"
+#include "inp_parser.h"
+#include "isolation.h"
+#include "optimizer.h"
+#include "json_output.h"
+#include "hydraulics.h"
+
+/* ── CLI defaults ─────────────────────────────────────────────────── */
+#define DEFAULT_OUTPUT  "output.json"
+#define DEFAULT_BUDGET  3
+#define DEFAULT_SEED    42
+#define DEFAULT_MODE    "full"
+
+/* ── Helpers ──────────────────────────────────────────────────────── */
+
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s --input <file.inp> [options]\n"
+        "Options:\n"
+        "  --output <file>       JSON output path (default: output.json)\n"
+        "  --budget N            Valve placement budget (default: 3)\n"
+        "  --fail id1,id2,...    Comma-separated pipe IDs to burst\n"
+        "  --stuck id1,id2,...   Comma-separated valve IDs to mark stuck-open\n"
+        "  --valves FILE         One link ID per line, optionally followed by 'stuck'\n"
+        "  --mode full|rank|reach  Analysis mode (default: full)\n"
+        "  --scenarios all|failed  Optimization scenarios (default: failed with --fail, otherwise all)\n"
+        "  --seed N              RNG seed for random placement (default: 42)\n"
+        "  --hydraulics on|off   Enable or disable EPANET output (default: on)\n"
+        "  --min-pressure N      PDA minimum pressure in psi (default: 20)\n"
+        "  --verbose             Print progress to stderr\n",
+        prog);
+}
+
+/** Split a comma-separated string of IDs into an array. Caller frees. */
+static char **split_ids(const char *csv, int *out_count) {
+    *out_count = 0;
+    if (!csv || csv[0] == '\0') return NULL;
+
+    char *copy = strdup(csv);
+    if (!copy) return NULL;
+
+    int cap = 16, cnt = 0;
+    char **arr = malloc((size_t)cap * sizeof(char *));
+    if (!arr) { free(copy); return NULL; }
+
+    char *tok = strtok(copy, ",");
+    while (tok) {
+        if (cnt >= cap) {
+            cap *= 2;
+            char **tmp = realloc(arr, (size_t)cap * sizeof(char *));
+            if (!tmp) break;
+            arr = tmp;
+        }
+        arr[cnt++] = strdup(tok);
+        tok = strtok(NULL, ",");
+    }
+    free(copy);
+    *out_count = cnt;
+    return arr;
+}
+
+static void free_ids(char **ids, int count) {
+    if (!ids) return;
+    for (int i = 0; i < count; i++) free(ids[i]);
+    free(ids);
+}
+
+static char *trim_arg(char *s) {
+    while (*s && isspace((unsigned char)*s)) s++;
+    char *e = s + strlen(s); while (e > s && isspace((unsigned char)e[-1])) *--e = '\0';
+    return s;
+}
+static int equal_ci_arg(const char *a, const char *b) {
+    while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) { a++; b++; }
+    return *a == '\0' && *b == '\0';
+}
+static int load_valves_file(const char *path, Graph *g, NetworkIndex *ni) {
+    FILE *fp = fopen(path, "r"); if (!fp) return -1;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        if (!strchr(line, '\n') && !feof(fp)) { fclose(fp); return -1; }
+        char *comment = strchr(line, ';'); if (!comment) comment = strchr(line, '#'); if (comment) *comment = '\0';
+        char *text = trim_arg(line); if (!*text) continue;
+        char id[64], status[32] = {0}; int n = sscanf(text, "%63s %31s", id, status), idx;
+        if (n < 1 || (n >= 2 && !equal_ci_arg(status, "stuck")) || !hashmap_get(ni->link_map, id, &idx)) { fclose(fp); return -1; }
+        g->links[idx].has_valve = true;
+        if (n >= 2 && equal_ci_arg(status, "stuck")) g->links[idx].status = STATUS_STUCK;
+    }
+    fclose(fp); return 0;
+}
+static void write_error_json(const char *path, const char *message) {
+    if (!path) return;
+    FILE *fp = fopen(path, "w"); if (!fp) return;
+    fprintf(fp, "{\"error\":\"");
+    for (const char *p = message; *p; p++) { if (*p == '"' || *p == '\\') fputc('\\', fp); fputc(*p, fp); }
+    fprintf(fp, "\"}\n"); fclose(fp);
+}
+
+/* ── main ─────────────────────────────────────────────────────────── */
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) { print_usage(argv[0]); return 1; }
+
+    /* Parse CLI arguments */
+    const char *input_file  = NULL;
+    const char *output_file = DEFAULT_OUTPUT;
+    const char *mode        = DEFAULT_MODE;
+    const char *scenario_mode = NULL;
+    const char *fail_csv    = NULL;
+    const char *stuck_csv   = NULL;
+    const char *valves_file = NULL;
+    int         budget      = DEFAULT_BUDGET;
+    unsigned    seed        = DEFAULT_SEED;
+    double      min_pressure = 20.0;
+    bool        hydraulics_enabled = true;
+    bool        verbose     = false;
+
+    for (int i = 1; i < argc; i++) {
+        if      (strcmp(argv[i], "--input")   == 0 && i+1 < argc) input_file  = argv[++i];
+        else if (strcmp(argv[i], "--output")  == 0 && i+1 < argc) output_file = argv[++i];
+        else if (strcmp(argv[i], "--budget")  == 0 && i+1 < argc) budget      = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--fail")    == 0 && i+1 < argc) fail_csv    = argv[++i];
+        else if (strcmp(argv[i], "--stuck")   == 0 && i+1 < argc) stuck_csv   = argv[++i];
+        else if (strcmp(argv[i], "--valves")  == 0 && i+1 < argc) valves_file = argv[++i];
+        else if (strcmp(argv[i], "--mode")    == 0 && i+1 < argc) mode        = argv[++i];
+        else if (strcmp(argv[i], "--scenarios") == 0 && i+1 < argc) scenario_mode = argv[++i];
+        else if (strcmp(argv[i], "--seed")    == 0 && i+1 < argc) seed        = (unsigned)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--hydraulics") == 0 && i+1 < argc) hydraulics_enabled = equal_ci_arg(argv[++i], "on");
+        else if (strcmp(argv[i], "--min-pressure") == 0 && i+1 < argc) min_pressure = atof(argv[++i]);
+        else if (strcmp(argv[i], "--verbose") == 0)                verbose     = true;
+        else if (strcmp(argv[i], "--help")    == 0) { print_usage(argv[0]); return 0; }
+    }
+
+    if (!input_file) {
+        fprintf(stderr, "Error: --input is required.\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    /* ── 1. Build graph and parse .inp ──────────────────────────── */
+    if (verbose) fprintf(stderr, "[1/6] Parsing %s ...\n", input_file);
+
+    Graph        *g  = graph_create(32, 64);
+    NetworkIndex *ni = network_index_create();
+    if (!g || !ni) { fprintf(stderr, "Out of memory\n"); return 1; }
+
+    if (parse_inp_file(input_file, g, ni) != 0) {
+        fprintf(stderr, "Failed to parse '%s'\n", input_file);
+        write_error_json(output_file, "invalid or empty input network");
+        graph_free(g); network_index_free(ni);
+        return 1;
+    }
+    if (verbose) graph_print_summary(g);
+    if (valves_file && load_valves_file(valves_file, g, ni) != 0) {
+        fprintf(stderr, "Failed to parse valves file '%s'\n", valves_file);
+        write_error_json(output_file, "invalid valves file");
+        graph_free(g); network_index_free(ni);
+        return 1;
+    }
+
+    /* ── 2. Apply --fail ───────────────────────────────────────── */
+    int   fail_count = 0;
+    char **fail_ids  = split_ids(fail_csv, &fail_count);
+    int  *failed_link_indices = NULL;
+    int   fli_count = 0;
+
+    if (fail_count > 0) {
+        failed_link_indices = malloc((size_t)fail_count * sizeof(int));
+        if (verbose) fprintf(stderr, "[2/6] Simulating %d pipe failure(s)...\n", fail_count);
+        for (int i = 0; i < fail_count; i++) {
+            int idx = -1;
+            if (!hashmap_get(ni->link_map, fail_ids[i], &idx)) {
+                fprintf(stderr, "Warning: pipe '%s' not found, skipping.\n", fail_ids[i]);
+                continue;
+            }
+            simulate_failure(g, idx);
+            failed_link_indices[fli_count++] = idx;
+        }
+    }
+    free_ids(fail_ids, fail_count);
+
+    /* ── 3. Apply --stuck ──────────────────────────────────────── */
+    int   stuck_count = 0;
+    char **stuck_ids  = split_ids(stuck_csv, &stuck_count);
+
+    if (stuck_count > 0) {
+        if (verbose) fprintf(stderr, "[3/6] Marking %d stuck valve(s)...\n", stuck_count);
+        for (int i = 0; i < stuck_count; i++) {
+            int idx = -1;
+            if (!hashmap_get(ni->link_map, stuck_ids[i], &idx)) {
+                fprintf(stderr, "Warning: valve '%s' not found, skipping.\n", stuck_ids[i]);
+                continue;
+            }
+            g->links[idx].status = STATUS_STUCK;
+        }
+    }
+    free_ids(stuck_ids, stuck_count);
+
+    /* ── 4. Structural analysis ────────────────────────────────── */
+    if (verbose) fprintf(stderr, "[4/6] Running structural analysis (DFS/Tarjan)...\n");
+    StructuralResult *sr = compute_structural_analysis(g);
+
+    /* ── 5. Reachability ───────────────────────────────────────── */
+    if (verbose) fprintf(stderr, "[5/6] Computing reachability (BFS)...\n");
+    ReachabilityResult *reach = compute_reachability(g);
+
+    /* ── 6. Isolation boundary ─────────────────────────────────── */
+    IsolationResult *iso = NULL;
+    if (fli_count > 0) {
+        if (verbose) fprintf(stderr, "      Computing isolation boundary...\n");
+        iso = compute_isolation(g, failed_link_indices, fli_count);
+    }
+
+    /* ── 7. Rank critical links ────────────────────────────────── */
+    if (verbose) fprintf(stderr, "      Ranking critical links...\n");
+    int ranked_count = 0;
+    RankedLink *ranked = rank_links(g, sr, RANK_BY_DISRUPTION, &ranked_count);
+
+    /* ── 8. Optimization (full mode only) ──────────────────────── */
+    OptimizationReport *report = NULL;
+    ScenarioSet *scenarios = NULL;
+    if (strcmp(mode, "full") == 0) {
+        if (verbose) fprintf(stderr, "[6/6] Running optimization (budget=%d)...\n", budget);
+        bool use_failed = fli_count > 0 && (!scenario_mode || strcmp(scenario_mode, "failed") == 0);
+        scenarios = use_failed ? scenario_set_failed(failed_link_indices, fli_count) : scenario_set_all(g);
+        report = run_full_optimization(g, budget, scenarios, sr, seed);
+    }
+
+    HydraulicsOutput *hydraulics = hydraulics_run(input_file, g, failed_link_indices, fli_count,
+        iso ? iso->valves_to_close : NULL, iso ? iso->valve_count : 0,
+        report ? report->greedy : NULL, budget, min_pressure, hydraulics_enabled);
+    if (reach && hydraulics) reach->pressure_deficient_count = hydraulics->pressure_deficient_count;
+
+    /* ── 9. Serialize and write JSON ───────────────────────────── */
+    if (verbose) fprintf(stderr, "      Writing %s ...\n", output_file);
+    char *json = json_full_report(g, reach, iso, sr, ranked, ranked_count, report,
+                                  hydraulics ? hydraulics->json : NULL);
+    if (json) {
+        if (json_write_to_file(output_file, json) == 0) {
+            if (verbose) fprintf(stderr, "Done. Results written to %s\n", output_file);
+            else printf("%s\n", output_file);
+        } else {
+            fprintf(stderr, "Error: could not write to '%s'\n", output_file);
+        }
+        json_free(json);
+    }
+
+    /* ── 10. Print summary to stderr if verbose ─────────────────── */
+    if (verbose && reach) {
+        fprintf(stderr, "\n=== Summary ===\n");
+        fprintf(stderr, "  Nodes: %d | Links: %d | Sources: %d\n",
+                g->node_count, g->link_count, g->source_count);
+        fprintf(stderr, "  Disconnected junctions: %d (%.2f L/s demand)\n",
+                reach->disconnected_count, reach->disconnected_demand);
+        if (iso) {
+            fprintf(stderr, "  Valves to close: %d\n", iso->valve_count);
+            fprintf(stderr, "  Extra disrupted by stuck valves: %d\n", iso->extra_disrupted_count);
+            fprintf(stderr, "  Total disrupted demand after isolation: %.2f L/s\n",
+                    iso->total_disrupted_demand);
+        }
+        if (sr) fprintf(stderr, "  Bridges: %d | Articulation points: %d\n",
+                        sr->bridge_count, sr->ap_count);
+        if (report && report->greedy)
+            fprintf(stderr, "  Greedy optimization: %.1f%% improvement (%.3f ms)\n",
+                    report->greedy->improvement_pct, report->greedy->runtime_ms);
+    }
+
+    /* ── Cleanup ─────────────────────────────────────────────────── */
+    free(failed_link_indices);
+    free_scenario_set(scenarios);
+    free(ranked);
+    free_reachability(reach);
+    free_isolation(iso);
+    free_structural(sr);
+    free_optimization_report(report);
+    hydraulics_free(hydraulics);
+    network_index_free(ni);
+    graph_free(g);
+    return 0;
+}

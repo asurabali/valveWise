@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.a
+*.obj
+backend/valvewise
+backend/valvewise.exe
+backend/tests/*.exe
+backend/output.json
+backend/test_output.json
+backend/test_multi.json
+
+# Node
+node_modules/
+*.log
+*.tmp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
